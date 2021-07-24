@@ -5,7 +5,6 @@ import (
 )
 
 func NewApi() api.Api {
-	// this _should_ paint to the production site
-
+	// this _should_ point to the production site
 	return api.NewApi(api.Options{})
 }
