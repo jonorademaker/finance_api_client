@@ -3,6 +3,7 @@
 package api
 
 import (
+	"log"
 	"os"
 	"testing"
 
@@ -13,11 +14,14 @@ import (
 
 func createTestApi() Api {
 	testUrl := os.Getenv("TEST_URL")
-	if testUrl == "" {
-		return NewApiWithUrl("http://localhost:8080")
+	logger := log.Default()
+	logger.SetFlags(log.Lshortfile)
+	options := Options{logger: logger}
+	if testUrl != "" {
+		options.baseUrl = testUrl
 	}
 
-	return NewApiWithUrl(testUrl)
+	return NewApi(options)
 }
 
 func createAccount(t *testing.T) models.OrganisationAccount {

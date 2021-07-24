@@ -2,8 +2,8 @@ package api
 
 import (
 	"bytes"
-	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -16,11 +16,55 @@ type Api struct {
 }
 
 type baseApi struct {
-	baseUrl string
+	baseUrl       string
+	client        *http.Client
+	logger        *log.Logger
+	retryStrategy retryStrategy
 }
 
-func NewApiWithUrl(baseUrl string) Api {
-	api := baseApi{baseUrl: baseUrl}
+type Options struct {
+	baseUrl               string
+	httpClient            *http.Client
+	timeoutInMilliseconds int
+	logger                *log.Logger
+	retryStrategy         retryStrategy
+}
+
+func createBaseApi(options Options) baseApi {
+	var logger *log.Logger
+	if options.logger != nil {
+		logger = options.logger
+		logger.SetPrefix("financeapi - ")
+	}
+
+	var client *http.Client
+	if options.httpClient == nil {
+		client = &http.Client{}
+	} else {
+		client = options.httpClient
+	}
+
+	client.Timeout = time.Duration(options.timeoutInMilliseconds) * time.Millisecond
+
+	var baseUrl string
+	if options.baseUrl == "" {
+		baseUrl = "http://localhost:8080"
+	} else {
+		baseUrl = options.baseUrl
+	}
+
+	var retryStrategy retryStrategy
+	if options.retryStrategy != nil {
+		retryStrategy = options.retryStrategy
+	} else {
+		retryStrategy = func(_ RetryOptions) bool { return false }
+	}
+
+	return baseApi{baseUrl: baseUrl, client: client, logger: logger, retryStrategy: retryStrategy}
+}
+
+func NewApi(options Options) Api {
+	api := createBaseApi(options)
 
 	return Api{
 		OrganisationalAccounts: organisationalAccounts{baseApi: api},
@@ -33,11 +77,11 @@ func (api *baseApi) post(resourceUrl string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	resp, err := perform("POST", fullUrl, data)
+	resp, err := api.perform("POST", fullUrl, data)
 	if err != nil {
 		return nil, models.FinanceApiError{Err: err}
 	}
-	return processResponse(resp)
+	return api.processResponse(resp)
 }
 
 func (api *baseApi) get(resourceUrl string) ([]byte, error) {
@@ -46,11 +90,11 @@ func (api *baseApi) get(resourceUrl string) ([]byte, error) {
 		return nil, err
 	}
 
-	resp, err := perform("GET", fullUrl, nil)
+	resp, err := api.perform("GET", fullUrl, nil)
 	if err != nil {
 		return nil, models.FinanceApiError{Err: err}
 	}
-	return processResponse(resp)
+	return api.processResponse(resp)
 }
 
 func (api *baseApi) delete(resourceUrl string, queryString map[string][]string) error {
@@ -59,16 +103,25 @@ func (api *baseApi) delete(resourceUrl string, queryString map[string][]string) 
 		return err
 	}
 
-	resp, err := perform("DELETE", fullUrl, nil)
+	resp, err := api.perform("DELETE", fullUrl, nil)
 	if err != nil {
 		return models.FinanceApiError{Err: err}
 	}
 
-	_, err = processResponse(resp)
+	_, err = api.processResponse(resp)
 	return err
 }
 
-func perform(method string, url *url.URL, data []byte) (*http.Response, error) {
+func (api *baseApi) perform(method string, url *url.URL, data []byte) (*http.Response, error) {
+	api.ifLog(func(log *log.Logger) {
+		if data != nil {
+			log.Printf("%s %s: %s", method, url, string(data))
+		} else {
+			log.Printf("%s %s", method, url)
+		}
+
+	})
+
 	req, err := http.NewRequest(method, url.String(), bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -80,19 +133,28 @@ func perform(method string, url *url.URL, data []byte) (*http.Response, error) {
 	req.Header.Add("User-Agent", "FinanceApi Coding Test Lib v0.0.3")
 	req.Header.Add("Accept", "application/vnd.api+json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+	retries := RetryOptions{}
+	for {
+		retries.response, retries.err = api.client.Do(req)
+		retries.count += 1
+
+		if retries.err != nil || !isSuccessResponse(retries.response) {
+			api.ifLog(func(log *log.Logger) { log.Printf("response error: %s", retries.err) })
+			if api.retryStrategy(retries) {
+				continue
+			}
+		}
+		return retries.response, retries.err
 	}
-	return resp, nil
 }
 
-func processResponse(resp *http.Response) ([]byte, error) {
+func (api *baseApi) processResponse(resp *http.Response) ([]byte, error) {
 	defer func() {
-		err := resp.Body.Close()
-		if err != nil {
-			fmt.Println("failed to close request body", err)
+		if resp != nil && resp.Body != nil {
+			err := resp.Body.Close()
+			if err != nil {
+				api.ifLog(func(log *log.Logger) { log.Printf("failed to close request body: %s", err) })
+			}
 		}
 	}()
 
@@ -105,7 +167,7 @@ func processResponse(resp *http.Response) ([]byte, error) {
 		}
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if isSuccessResponse(resp) {
 		return responseBody, nil
 	}
 
@@ -128,4 +190,16 @@ func (api *baseApi) buildUrl(resourceUrl string, queryString map[string][]string
 	}
 	fullUrl.RawQuery = q.Encode()
 	return fullUrl, nil
+}
+
+// ifLog takes a function so we don't do unnecessary work in order to do
+// some logging, e.g. decoding bytes to string
+func (api *baseApi) ifLog(logFunc func(logger *log.Logger)) {
+	if api.logger != nil {
+		logFunc(api.logger)
+	}
+}
+
+func isSuccessResponse(resp *http.Response) bool {
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
